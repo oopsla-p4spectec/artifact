@@ -1,6 +1,7 @@
 [submodule "hol4p4"]
 	path = hol4p4
-	url = https://github.com/oopsla-p4spectec/hol4p4
+	url = https://github.com/oopsla-p4spectec/hol4p4.git
+	branch = artifact
 [submodule "petr4"]
 	path = petr4
 	url = https://github.com/oopsla-p4spectec/petr4
