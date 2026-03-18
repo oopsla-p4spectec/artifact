@@ -4,7 +4,8 @@
 	branch = artifact
 [submodule "petr4"]
 	path = petr4
-	url = https://github.com/oopsla-p4spectec/petr4
+	url = https://github.com/oopsla-p4spectec/petr4.git
+	branch = artifact
 [submodule "p4-spectec"]
 	path = p4-spectec
 	url = https://github.com/oopsla-p4spectec/p4-spectec.git
