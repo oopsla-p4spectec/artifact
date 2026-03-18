@@ -1,0 +1,9 @@
+[submodule "hol4p4"]
+	path = hol4p4
+	url = https://github.com/oopsla-p4spectec/hol4p4
+[submodule "petr4"]
+	path = petr4
+	url = https://github.com/oopsla-p4spectec/petr4
+[submodule "p4-spectec"]
+	path = p4-spectec
+	url = https://github.com/oopsla-p4spectec/p4-spectec.git

@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+
+import argparse
+import datetime
+import glob
+import os
+import re
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+
+def _collect_excluded_basenames(
+    suite_dir: str,
+    excludes_dir: str,
+    ignore_list: list[str] | None = None,
+) -> set[str]:
+    """Return basenames of files in suite_dir that match any exclusion rule."""
+    suite_path = Path(suite_dir).resolve()
+    exclude_root = Path(excludes_dir).resolve()
+    suite_files = {f: str(suite_path / f) for f in os.listdir(suite_path)}
+    ignores = [str(Path(p)) for p in ignore_list] if ignore_list else []
+
+    exclude_files = []
+    for root, _, files in os.walk(exclude_root):
+        for file in files:
+            if file.endswith(".exclude"):
+                exclude_files.append(Path(root) / file)
+
+    excluded_full_paths = set()
+    for exclude_file in exclude_files:
+        rel_path = (
+            str(exclude_file.relative_to(exclude_root))
+            if exclude_file.is_relative_to(exclude_root)
+            else str(exclude_file)
+        )
+        if any(
+            rel_path == ig or rel_path.startswith(str(Path(ig)) + os.sep)
+            for ig in ignores
+        ):
+            continue
+
+        with open(exclude_file) as f:
+            for line in f:
+                entry = line.strip()
+                if not entry:
+                    continue
+
+                entry_path = Path(entry)
+                stem = entry_path.stem
+                suffix = entry_path.suffix
+                entry_parts = set(entry_path.parts)
+
+                if ("p4_16_samples" in entry_parts and "p4_16_errors" in suite_dir) or (
+                    "p4_16_errors" in entry_parts and "p4_16_errors" not in suite_dir
+                ):
+                    continue
+
+                if "testdata/p4testgen" in entry and suffix == ".stf":
+                    match = re.match(r"(.+)_(\d+)$", stem)
+                    if match:
+                        target_p4 = f"{match.group(1)}__{match.group(2)}.p4"
+                        if target_p4 in suite_files:
+                            excluded_full_paths.add(suite_files[target_p4])
+                    elif f"{stem}.stf" in suite_files:
+                        excluded_full_paths.add(suite_files[f"{stem}.stf"])
+                elif suffix == ".p4":
+                    if f"{stem}.p4" in suite_files:
+                        excluded_full_paths.add(suite_files[f"{stem}.p4"])
+                    family_pattern = re.compile(rf"^{re.escape(stem)}__\d+\.p4$")
+                    for filename in suite_files:
+                        if family_pattern.match(filename):
+                            excluded_full_paths.add(suite_files[filename])
+                else:
+                    full_name = f"{stem}{suffix}"
+                    if full_name in suite_files:
+                        excluded_full_paths.add(suite_files[full_name])
+
+    return {Path(p).name for p in excluded_full_paths}
+
+
+def apply_excludes(
+    suite_dir: str,
+    excludes_dir: str,
+    ignore_list: list[str] | None = None,
+    testdata_dir: str | None = None,
+    patches_dir: str | None = None,
+) -> str:
+    """
+    Copy non-excluded files (and their paired counterparts) from suite_dir into
+    a fresh suite_dir.filtered directory.  If testdata_dir and
+    patches_dir are given, any file present in the corresponding
+    patches subdirectory is copied over the filtered copy (overriding it).
+    Returns the path to the filtered directory.
+    """
+    suite_path = Path(suite_dir).resolve()
+    excluded = _collect_excluded_basenames(suite_dir, excludes_dir, ignore_list)
+
+    # Also exclude paired files: if foo.p4 is excluded, exclude foo.stf too
+    paired = set()
+    for name in excluded:
+        stem = Path(name).stem
+        suffix = Path(name).suffix
+        if suffix == ".p4":
+            paired.add(f"{stem}.stf")
+        elif suffix == ".stf":
+            paired.add(f"{stem}.p4")
+    excluded |= {p for p in paired if (suite_path / p).exists()}
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filtered = suite_path.with_name(suite_path.name + f".{timestamp}.filtered")
+    if filtered.exists():
+        shutil.rmtree(filtered)
+    filtered.mkdir(parents=True, exist_ok=True)
+
+    copied = 0
+    for f in suite_path.iterdir():
+        if f.is_file() and f.name not in excluded:
+            shutil.copy2(f, filtered / f.name)
+            copied += 1
+
+    print(f"Copied {copied} files to {filtered} (excluded {len(excluded)}).")
+
+    # Apply testdata patches: overwrite filtered files with patched versions
+    patched = 0
+    if testdata_dir and patches_dir:
+        try:
+            suite_rel = suite_path.relative_to(Path(testdata_dir).resolve())
+            patch_suite = Path(patches_dir).resolve() / suite_rel
+            if patch_suite.is_dir():
+                for pf in patch_suite.iterdir():
+                    if pf.is_file() and (filtered / pf.name).exists():
+                        shutil.copy2(pf, filtered / pf.name)
+                        patched += 1
+        except ValueError:
+            pass  # suite_dir not under testdata_dir — skip patches
+
+    if patched:
+        print(f"Applied {patched} patch override(s) in {filtered}.")
+
+    return str(filtered)
+
+
+def run_stat(spectec_dir: str, logs_dir: Path):
+    cmd = ["make", "stat"]
+    print(f"+ {' '.join(cmd)}")
+    log_path = logs_dir / "make-stat.log"
+    with open(log_path, "w") as f:
+        subprocess.run(cmd, cwd=spectec_dir, check=True, stdout=f, stderr=f)
+    print(f"Results written to {log_path}.")
+
+    cmd = ["./p4stat"] + [f"{spectec_dir}/spec-concrete"]
+    print(f"+ {' '.join(cmd)}")
+    log_path = logs_dir / "p4stat.log"
+    result = subprocess.run(cmd, cwd=spectec_dir, capture_output=True, text=True)
+    with open(log_path, "w") as f:
+        f.write(result.stdout)
+        f.write(result.stderr)
+    print(result.stdout, end="")
+    print(f"Results written to {log_path}.")
+
+
+def run_perf(spectec_dir: str, includes_dir: str, excludes_dir: str, testdata_dir: str, logs_dir: Path, patches_dir: str | None = None):
+    rq2_dir = logs_dir
+    time_log = logs_dir / "time.log"
+    rq2_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = ["make", "perf"]
+    print(f"+ {' '.join(cmd)}")
+    make_perf_log = rq2_dir / "make-perf.log"
+    with open(make_perf_log, "w") as f:
+        subprocess.run(cmd, cwd=spectec_dir, check=True, stdout=f, stderr=f)
+    print(f"Results written to {make_perf_log}.")
+
+    print("\n=== Applying excludes ===")
+    samples_dir = apply_excludes(
+        str(Path(testdata_dir) / "p4_16_samples"),
+        str(Path(excludes_dir) / "static"),
+        testdata_dir=testdata_dir,
+        patches_dir=patches_dir,
+    )
+    p4testgen_v1model_dir = apply_excludes(
+        str(Path(testdata_dir) / "p4testgen" / "v1model"),
+        excludes_dir,
+        testdata_dir=testdata_dir,
+        patches_dir=patches_dir,
+    )
+    p4testgen_ebpf_dir = apply_excludes(
+        str(Path(testdata_dir) / "p4testgen" / "ebpf"),
+        excludes_dir,
+        testdata_dir=testdata_dir,
+        patches_dir=patches_dir,
+    )
+
+    base_run = [
+        "./p4perf", "run",
+        "-s", "spec-concrete",
+        "-i", includes_dir,
+        "-p4-dir", samples_dir,
+        "-rel", "Program_inst",
+    ]
+
+    base_sim_v1model = [
+        "./p4perf", "sim",
+        "-s", "spec-concrete",
+        "-i", includes_dir,
+        "-p4-dir", p4testgen_v1model_dir,
+        "-stf-dir", p4testgen_v1model_dir,
+        "-arch", "v1model",
+    ]
+
+    base_sim_ebpf = [
+        "./p4perf", "sim",
+        "-s", "spec-concrete",
+        "-i", includes_dir,
+        "-p4-dir", p4testgen_ebpf_dir,
+        "-stf-dir", p4testgen_ebpf_dir,
+        "-arch", "ebpf",
+    ]
+
+    benchmarks = [
+        ("POS-SL",           base_run          + ["-sl"],          "pos_sl.log"),
+        ("POS-SL-det",       base_run          + ["-sl", "-det"],  "pos_sl_det.log"),
+        ("POS-IL",           base_run          + ["-il"],          "pos_il.log"),
+        ("POS-IL-det",       base_run          + ["-il", "-det"],  "pos_il_det.log"),
+        ("EBPF+-SL",         base_sim_ebpf     + ["-sl"],          "ebpf_sl.log"),
+        ("EBPF+-SL-det",     base_sim_ebpf     + ["-sl", "-det"],  "ebpf_sl_det.log"),
+        ("EBPF+-IL",         base_sim_ebpf     + ["-il"],          "ebpf_il.log"),
+        ("EBPF+-IL-det",     base_sim_ebpf     + ["-il", "-det"],  "ebpf_il_det.log"),
+        ("V1MODEL+-SL",      base_sim_v1model  + ["-sl"],          "v1model_sl.log"),
+        ("V1MODEL+-SL-det",  base_sim_v1model  + ["-sl", "-det"],  "v1model_sl_det.log"),
+        ("V1MODEL+-IL",      base_sim_v1model  + ["-il"],          "v1model_il.log"),
+        ("V1MODEL+-IL-det",  base_sim_v1model  + ["-il", "-det"],  "v1model_il_det.log"),
+    ]
+
+    for label, command, log_file in benchmarks:
+        print(f"\n=== Running {label} ===")
+        print(f"+ {' '.join(command)}")
+        filepath = str(rq2_dir / log_file)
+        with open(filepath, "w") as f:
+            start = time.perf_counter()
+            subprocess.run(command, cwd=spectec_dir, stdout=f, stderr=f)
+            elapsed = time.perf_counter() - start
+        msg = f"{label} runtime: {elapsed:.3f}s"
+        print(msg)
+        print(f"Results written to {filepath}.")
+        with open(time_log, "a") as f:
+            f.write(msg + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run RQ2 benchmarks for p4spectec.")
+    parser.add_argument(
+        "--spectec", required=True, metavar="DIR",
+        help="p4-spectec project root (contains p4perf/p4stat binaries and spec-concrete/)",
+    )
+    parser.add_argument(
+        "-i", "--includes", required=True, metavar="DIR",
+        help="Directory passed as -i (p4 include path) to p4perf",
+    )
+    parser.add_argument(
+        "-e", "--excludes", required=True, metavar="DIR",
+        help="Root excludes directory containing .exclude files",
+    )
+    parser.add_argument(
+        "-t", "--testdata", required=True, metavar="DIR",
+        help="Root testdata directory containing p4_16_samples/ and p4testgen/ sub-directories",
+    )
+    parser.add_argument(
+        "-p", "--patches", default=None, metavar="DIR",
+        help="Directory of patched test files that override originals (mirrors testdata structure)",
+    )
+    parser.add_argument(
+        "-l", "--logs", required=True, metavar="DIR",
+        help="Base logs directory; rq2/ and time.log will be written inside it",
+    )
+    args = parser.parse_args()
+
+    spectec_dir  = str(Path(args.spectec).resolve())
+    includes_dir = str(Path(args.includes).resolve())
+    excludes_dir = str(Path(args.excludes).resolve())
+    testdata_dir = str(Path(args.testdata).resolve())
+    patches_dir  = str(Path(args.patches).resolve()) if args.patches else None
+    logs_dir     = Path(args.logs).resolve() / "rq2"
+
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    run_stat(spectec_dir, logs_dir)
+    print()
+    run_perf(spectec_dir, includes_dir, excludes_dir, testdata_dir, logs_dir, patches_dir)
+
+
+if __name__ == "__main__":
+    main()

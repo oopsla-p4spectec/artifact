@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+
+import argparse
+import datetime
+import glob
+import json
+import os
+import re
+import subprocess
+from enum import Enum
+from pathlib import Path
+
+from tqdm import tqdm
+
+
+
+class TestResult(str, Enum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+    SKIP = "SKIP"
+
+
+class StaticTestType(Enum):
+    POS = "POS"
+    NEG = "NEG"
+
+
+class Arch(Enum):
+    V1MODEL = "v1model"
+    EBPF = "ebpf"
+    PSA = "psa"
+
+
+def get_time():
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def dump_json(data, logs_dir: Path, label=""):
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    filename = label + get_time() + ".json"
+    filepath = str(logs_dir / filename)
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(f"Results written to {filepath}.")
+
+
+def get_p4_stf_pairs(directory_path: str) -> set[tuple[str, str]]:
+    base_path = Path(directory_path).resolve()
+    stf_files = {f.stem: str(f) for f in base_path.iterdir() if f.suffix == ".stf"}
+    pairs = set()
+    for p4_file in base_path.iterdir():
+        if p4_file.suffix == ".p4":
+            stem = p4_file.stem
+            if stem in stf_files:
+                pairs.add((str(p4_file), stf_files[stem]))
+    return pairs
+
+
+def read_test_suite(
+    test_suite_dir: str,
+    excludes_dir: str,
+    ignore_list: list[str] | None = None,
+) -> tuple[set[str], set[tuple[str, str]], set[str]]:
+    """Returns (programs, pairs, excluded)."""
+    test_suite_path = Path(test_suite_dir).resolve()
+    exclude_root = Path(excludes_dir).resolve()
+    suite_files = {f: str(test_suite_path / f) for f in os.listdir(test_suite_path)}
+    ignores = [str(Path(p)) for p in ignore_list] if ignore_list else []
+
+    exclude_files = []
+    for root, _, files in os.walk(exclude_root):
+        for file in files:
+            if file.endswith(".exclude"):
+                exclude_files.append(Path(root) / file)
+
+    excluded_full_paths = set()
+    for exclude_file in exclude_files:
+        rel_path = (
+            str(exclude_file.relative_to(exclude_root))
+            if exclude_file.is_relative_to(exclude_root)
+            else str(exclude_file)
+        )
+        if any(
+            rel_path == ig or rel_path.startswith(str(Path(ig)) + os.sep)
+            for ig in ignores
+        ):
+            continue
+
+        with open(exclude_file, "r") as f:
+            for line in f:
+                entry = line.strip()
+                if not entry:
+                    continue
+
+                entry_path = Path(entry)
+                entry_parts = set(entry_path.parts)
+
+                if (
+                    "p4_16_samples" in entry_parts and "p4_16_errors" in test_suite_dir
+                ) or (
+                    "p4_16_errors" in entry_parts
+                    and "p4_16_errors" not in test_suite_dir
+                ):
+                    continue
+
+                stem = entry_path.stem
+                suffix = entry_path.suffix
+
+                if "testdata/p4testgen" in entry and suffix == ".stf":
+                    match = re.match(r"(.+)_(\d+)$", stem)
+                    if match:
+                        target_p4 = f"{match.group(1)}__{match.group(2)}.p4"
+                        if target_p4 in suite_files:
+                            excluded_full_paths.add(suite_files[target_p4])
+                    elif f"{stem}.stf" in suite_files:
+                        excluded_full_paths.add(suite_files[f"{stem}.stf"])
+                elif suffix == ".p4":
+                    if f"{stem}.p4" in suite_files:
+                        excluded_full_paths.add(suite_files[f"{stem}.p4"])
+                    family_pattern = re.compile(rf"^{re.escape(stem)}__\d+\.p4$")
+                    for filename in suite_files:
+                        if family_pattern.match(filename):
+                            excluded_full_paths.add(suite_files[filename])
+                else:
+                    full_name = f"{stem}{suffix}"
+                    if full_name in suite_files:
+                        excluded_full_paths.add(suite_files[full_name])
+
+    excluded = {Path(path).name for path in excluded_full_paths}
+    pairs = get_p4_stf_pairs(test_suite_dir)
+    programs = set(suite_files.values())
+    return programs, pairs, excluded
+
+
+def print_summary(results: list):
+    counts = {r: 0 for r in TestResult}
+    for entry in results:
+        counts[entry[-1]] += 1
+    print(
+        f"  PASS: {counts[TestResult.PASS]}"
+        f"  FAIL: {counts[TestResult.FAIL]}"
+        f"  SKIP: {counts[TestResult.SKIP]}"
+    )
+    fails = [entry[0] for entry in results if entry[-1] == TestResult.FAIL]
+    if fails:
+        print("  Failed:")
+        for path in sorted(fails):
+            print(f"    [FAIL] {path}")
+
+
+def run_static(programs: set[str], excluded: set[str], typ: StaticTestType, includes_dir: str, spectec_dir: str, logs_dir: Path):
+    watsup_files = sorted(glob.glob(f"{spectec_dir}/spec-concrete/*/*.watsup"))
+    results = []
+
+    log_path = logs_dir / f"static-{typ.value}-{get_time()}.log"
+    with open(log_path, "w") as log_f:
+        for p4_path in tqdm(sorted(programs), desc=f"static-{typ.value}", unit="file"):
+            if Path(p4_path).name in excluded:
+                results.append((p4_path, TestResult.SKIP))
+                continue
+
+            command = (
+                ["./p4spectec-test", "run"]
+                + watsup_files
+                + ["-i", includes_dir, "-rel", "Program_inst", "-sl", "-p", p4_path]
+            )
+            result = subprocess.run(command, cwd=spectec_dir, stdout=log_f, stderr=log_f)
+
+            ok = result.returncode == 42 if typ == StaticTestType.POS else result.returncode == 6
+            results.append((p4_path, TestResult.PASS if ok else TestResult.FAIL))
+
+    print(f"Subprocess logs written to {log_path}.")
+    dump_json(results, logs_dir, f"static-{typ.value}-")
+    print_summary(results)
+    return results
+
+
+def run_dynamic(pairs: set[tuple[str, str]], excluded: set[str], arch: Arch, label: str, includes_dir: str, spectec_dir: str, logs_dir: Path):
+    watsup_files = sorted(glob.glob(f"{spectec_dir}/spec-concrete/*/*.watsup"))
+    results = []
+
+    log_path = logs_dir / f"{label}-{get_time()}.log"
+    with open(log_path, "w") as log_f:
+        for p4_path, stf_path in tqdm(sorted(pairs), desc=label, unit="pair"):
+            if Path(p4_path).name in excluded or Path(stf_path).name in excluded:
+                results.append((p4_path, stf_path, TestResult.SKIP))
+                continue
+
+            command = (
+                ["./p4spectec-test", "sim"]
+                + watsup_files
+                + [
+                    "-i", includes_dir,
+                    "-arch", arch.value,
+                    "-sl",
+                    "-p", p4_path,
+                    "-stf", stf_path,
+                ]
+            )
+            result = subprocess.run(command, cwd=spectec_dir, stdout=log_f, stderr=log_f)
+
+            outcome = TestResult.PASS if result.returncode == 42 else TestResult.FAIL
+            results.append((p4_path, stf_path, outcome))
+
+    print(f"Subprocess logs written to {log_path}.")
+    dump_json(results, logs_dir, label + "-")
+    print_summary(results)
+    return results
+
+
+def apply_patches(
+    pairs: set[tuple[str, str]],
+    testdata_dir: str,
+    patches_dir: str,
+) -> set[tuple[str, str]]:
+    """
+    For each (p4_path, stf_path) pair, substitute any file that has a
+    corresponding override under patches_dir (mirroring the testdata_dir
+    subtree structure).  Files not covered by a patch are kept as-is.
+    """
+    testdata_root = Path(testdata_dir).resolve()
+    patches_root  = Path(patches_dir).resolve()
+    patched_pairs: set[tuple[str, str]] = set()
+
+    for p4_path, stf_path in pairs:
+        p4  = Path(p4_path).resolve()
+        stf = Path(stf_path).resolve()
+
+        try:
+            p4_rel  = p4.relative_to(testdata_root)
+            stf_rel = stf.relative_to(testdata_root)
+        except ValueError:
+            patched_pairs.add((p4_path, stf_path))
+            continue
+
+        p4_patch  = patches_root / p4_rel
+        stf_patch = patches_root / stf_rel
+
+        new_p4  = str(p4_patch)  if p4_patch.exists()  else p4_path
+        new_stf = str(stf_patch) if stf_patch.exists() else stf_path
+        patched_pairs.add((new_p4, new_stf))
+
+    return patched_pairs
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run RQ1 tests for p4spectec.")
+    parser.add_argument(
+        "-i", "--includes", required=True, metavar="DIR",
+        help="Directory passed as -i (p4 include path) to p4spectec-test",
+    )
+    parser.add_argument(
+        "-e", "--excludes", required=True, metavar="DIR",
+        help="Root excludes directory containing .exclude files",
+    )
+    parser.add_argument(
+        "-t", "--testdata", required=True, metavar="DIR",
+        help="Root testdata directory containing p4_16_samples, p4_16_errors, p4c/, p4testgen/ sub-directories",
+    )
+    parser.add_argument(
+        "--spectec", required=True, metavar="DIR",
+        help="p4-spectec project root (contains p4spectec-test binary and spec-concrete/)",
+    )
+    parser.add_argument(
+        "-l", "--logs", required=True, metavar="DIR",
+        help="Directory where JSON result logs will be written",
+    )
+    parser.add_argument(
+        "-p", "--patches", default=None, metavar="DIR",
+        help="Directory of patched test files that override originals (mirrors testdata structure)",
+    )
+    args = parser.parse_args()
+
+    includes_dir = str(Path(args.includes).resolve())
+    excludes_dir = str(Path(args.excludes).resolve())
+    testdata_dir = str(Path(args.testdata).resolve())
+    spectec_dir     = str(Path(args.spectec).resolve())
+    logs_dir     = Path(args.logs).resolve() / "rq1"
+    patches_dir  = str(Path(args.patches).resolve()) if args.patches else None
+
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    make_log = logs_dir / "make-spec-test.log"
+    with open(make_log, "w") as f:
+        subprocess.run(["make", "spec-test"], cwd=spectec_dir, check=True, stdout=f, stderr=f)
+    print(f"make spec-test log written to {make_log}.")
+
+    # Static tests (run)
+    print("\n=== Static POS ===")
+    programs, _, excluded = read_test_suite(
+        str(Path(testdata_dir) / "p4_16_samples"),
+        str(Path(excludes_dir) / "static"),
+    )
+    run_static(programs, excluded, StaticTestType.POS, includes_dir, spectec_dir, logs_dir)
+
+    print("\n=== Static NEG ===")
+    programs, _, excluded = read_test_suite(
+        str(Path(testdata_dir) / "p4_16_errors"),
+        str(Path(excludes_dir) / "static"),
+    )
+    run_static(programs, excluded, StaticTestType.NEG, includes_dir, spectec_dir, logs_dir)
+
+    # Dynamic tests (sim)
+    dynamic_suites = [
+        (str(Path(testdata_dir) / "p4c" / "v1model"),       Arch.V1MODEL, "p4c-v1model"),
+        (str(Path(testdata_dir) / "p4c" / "ebpf"),          Arch.EBPF,    "p4c-ebpf"),
+        (str(Path(testdata_dir) / "p4c" / "psa"),           Arch.PSA,     "p4c-psa"),
+        (str(Path(testdata_dir) / "p4testgen" / "v1model"), Arch.V1MODEL, "p4testgen-v1model"),
+        (str(Path(testdata_dir) / "p4testgen" / "ebpf"),    Arch.EBPF,    "p4testgen-ebpf"),
+    ]
+
+    for suite_dir, arch, label in dynamic_suites:
+        print(f"\n=== Dynamic {label} ===")
+        _, pairs, excluded = read_test_suite(
+            suite_dir, excludes_dir, ignore_list=["static/limit/"]
+        )
+        if patches_dir:
+            pairs = apply_patches(pairs, testdata_dir, patches_dir)
+        run_dynamic(pairs, excluded, arch, label, includes_dir, spectec_dir, logs_dir)
+
+
+if __name__ == "__main__":
+    main()

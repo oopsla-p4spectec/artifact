@@ -1,0 +1,1119 @@
+#!/usr/bin/env python3
+
+from dataclasses import dataclass, field
+from enum import Enum
+from patch import patch_directory
+from pathlib import Path
+import argparse
+import csv
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+
+
+class TestResult(str, Enum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+    SKIP = "SKIP"
+
+
+class Arch(Enum):
+    V1MODEL = "V1MODEL"
+    EBPF = "EBPF"
+
+
+class StaticTestType(Enum):
+    POS = "POS"
+    NEG = "NEG"
+
+
+# absolute path to p4 file
+StaticTestRecord = list[tuple[str, TestResult]]
+
+# absolute path to p4 file, absolute path to stf file
+DynamicTestRecord = list[tuple[str, str, TestResult]]
+
+
+@dataclass
+class Dirs:
+    spectec:  str  # p4-spectec project root
+    petr4:    str  # petr4 project root
+    hol4p4:   str  # HOL4P4 project root
+    includes: str  # p4 include path (-i / -I)
+    excludes: str  # root excludes dir
+    testdata: str  # root testdata dir
+    logs:     str  # directory for all JSON / CSV output
+
+
+@dataclass
+class Suites:
+    positive:          "TestSuite"
+    negative:          "TestSuite"
+    negative_petr4:    "TestSuite"
+    p4c_v1model:       "TestSuite"
+    p4c_ebpf:          "TestSuite"
+    p4testgen_v1model: "TestSuite"
+    p4testgen_ebpf:    "TestSuite"
+
+
+def read_static_test_record(path_to_json: str) -> StaticTestRecord:
+    with open(path_to_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    return data
+
+
+def read_dynamic_test_record(path_to_json: str) -> DynamicTestRecord:
+    with open(path_to_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    return data
+
+
+def get_time():
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def dump_json(data, dir: str, label=""):
+    filename = label + get_time() + ".json"
+    filepath = str(Path(dir).resolve() / filename)
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"Results json written to {filepath}.")
+
+
+@dataclass
+class TestSuite:
+    # absolute path to p4 file, absolute path to stf file (only populated in dynamic)
+    pairs: set[tuple[str, str]] = field(default_factory=set)
+    # set of p4 programs
+    programs: set[str] = field(default_factory=set)
+    # basename of excluded file
+    excluded: set[str] = field(default_factory=set)
+
+
+def get_p4_stf_pairs(directory_path: str) -> set[tuple[str, str]]:
+    """
+    Scans a directory for .p4 and .stf file pairs with matching stems.
+    Returns a set of tuples: (abs_path_to_p4, abs_path_to_stf).
+    """
+    base_path = Path(directory_path).resolve()
+    pairs = set()
+
+    # Get a set of all .stf filenames for O(1) lookups
+    # Using stem as the key: { 'foo': 'abs/path/to/foo.stf' }
+    stf_files = {f.stem: str(f) for f in base_path.iterdir() if f.suffix == ".stf"}
+
+    # Iterate through .p4 files and look for matches
+    for p4_file in base_path.iterdir():
+        if p4_file.suffix == ".p4":
+            stem = p4_file.stem
+            if stem in stf_files:
+                pairs.add((str(p4_file), stf_files[stem]))
+
+    return pairs
+
+
+def read_test_suite(
+    test_suite_dir: str,
+    excludes_dir: str,
+    ignore_list: list[str] | None = None,
+    additional_list: list[str] | None = None,
+) -> TestSuite:
+    test_suite_path = Path(test_suite_dir).resolve()
+    exclude_root = Path(excludes_dir).resolve()
+
+    suite_files = {f: str(test_suite_path / f) for f in os.listdir(test_suite_path)}
+
+    excluded_full_paths = set()
+    ignores = [str(Path(p)) for p in ignore_list] if ignore_list else []
+
+    # --- collect exclude files ---
+    exclude_files = []
+
+    for root, _, files in os.walk(exclude_root):
+        for file in files:
+            if file.endswith(".exclude"):
+                exclude_files.append(Path(root) / file)
+
+    if additional_list:
+        exclude_files.extend(Path(p) for p in additional_list)
+
+    # --- process exclude files ---
+    for exclude_file in exclude_files:
+        rel_path = (
+            str(exclude_file.relative_to(exclude_root))
+            if exclude_file.is_relative_to(exclude_root)
+            else str(exclude_file)
+        )
+
+        if any(
+            rel_path == ig or rel_path.startswith(str(Path(ig)) + os.sep)
+            for ig in ignores
+        ):
+            continue
+
+        with open(exclude_file, "r") as f:
+            for line in f:
+                entry = line.strip()
+                if not entry:
+                    continue
+
+                entry_path = Path(entry)
+                entry_parts = set(entry_path.parts)
+
+                # --- THE SMART GUARD ---
+                if (
+                    "p4_16_samples" in entry_parts and "p4_16_errors" in test_suite_dir
+                ) or (
+                    "p4_16_errors" in entry_parts
+                    and "p4_16_errors" not in test_suite_dir
+                ):
+                    continue
+
+                stem = entry_path.stem
+                suffix = entry_path.suffix
+
+                if "testdata/p4testgen" in entry and suffix == ".stf":
+                    match = re.match(r"(.+)_(\d+)$", stem)
+                    if match:
+                        target_p4 = f"{match.group(1)}__{match.group(2)}.p4"
+                        if target_p4 in suite_files:
+                            excluded_full_paths.add(suite_files[target_p4])
+                    elif f"{stem}.stf" in suite_files:
+                        excluded_full_paths.add(suite_files[f"{stem}.stf"])
+
+                elif suffix == ".p4":
+                    if f"{stem}.p4" in suite_files:
+                        excluded_full_paths.add(suite_files[f"{stem}.p4"])
+
+                    family_pattern = re.compile(rf"^{re.escape(stem)}__\d+\.p4$")
+                    for filename in suite_files:
+                        if family_pattern.match(filename):
+                            excluded_full_paths.add(suite_files[filename])
+
+                else:
+                    full_name = f"{stem}{suffix}"
+                    if full_name in suite_files:
+                        excluded_full_paths.add(suite_files[full_name])
+
+    excluded = {Path(path).name for path in excluded_full_paths}
+
+    pairs = get_p4_stf_pairs(test_suite_dir)
+
+    programs = set(suite_files.values())
+
+    return TestSuite(programs=programs, pairs=pairs, excluded=excluded)
+
+
+def is_exclude_program(excludes: set[str], program: str) -> bool:
+    return Path(program).name in excludes
+
+
+def is_exclude_pair(excludes: set[str], pair: tuple[str, str]) -> bool:
+    p4_path, stf_path = pair
+
+    return (Path(p4_path).name in excludes) or (Path(stf_path).name in excludes)
+
+
+############################### STATIC ###############################
+
+
+def run_p4spectec_static(
+    test_suite: TestSuite, typ: StaticTestType, dirs: Dirs
+) -> StaticTestRecord:
+    print(f"\n=== P4-SpecTec static {typ.value} ({len(test_suite.programs)} programs) ===")
+    excluded = test_suite.excluded
+
+    results: StaticTestRecord = []
+
+    watsup_files = sorted(glob.glob(f"{dirs.spectec}/spec-concrete/*/*.watsup"))
+
+    log_path = Path(dirs.logs) / f"p4spectec-typecheck-{typ.value}-{get_time()}.log"
+    with open(log_path, "w") as log_f:
+        for p4_path in test_suite.programs:
+            if is_exclude_program(excluded, p4_path):
+                results.append((p4_path, TestResult.SKIP))
+                continue
+
+            command = (
+                ["./p4spectec-test", "run"]
+                + watsup_files
+                + ["-i", dirs.includes, "-rel", "Program_inst", "-sl", "-p", p4_path]
+            )
+
+            result = subprocess.run(
+                command,
+                cwd=dirs.spectec,
+                stdout=log_f,
+                stderr=log_f,
+            )
+
+            # 42 on success, 6 on failure
+            if typ == StaticTestType.POS:
+                if result.returncode == 42:
+                    results.append((p4_path, TestResult.PASS))
+                else:
+                    results.append((p4_path, TestResult.FAIL))
+            else:
+                if result.returncode == 6:
+                    results.append((p4_path, TestResult.PASS))
+                else:
+                    results.append((p4_path, TestResult.FAIL))
+
+    print(f"Subprocess logs written to {log_path}.")
+    dump_json(results, dirs.logs, f"typecheck-{typ.value}-")
+
+    return results
+
+
+def run_petr4_static(test_suite: TestSuite, typ: StaticTestType, dirs: Dirs) -> StaticTestRecord:
+    print(f"\n=== Petr4 static {typ.value} ({len(test_suite.programs)} programs) ===")
+    excluded = test_suite.excluded
+
+    results: StaticTestRecord = []
+
+    petr4_exclude = str(Path(dirs.petr4) / "petr4.exclude")
+
+    log_path = Path(dirs.logs) / f"petr4-typecheck-{typ.value}-{get_time()}.log"
+    with open(log_path, "w") as log_f:
+        for p4_path in test_suite.programs:
+            if is_exclude_program(excluded, p4_path):
+                results.append((p4_path, TestResult.SKIP))
+                continue
+
+            command = ["./_opam/bin/petr4", "typecheck", "-I", dirs.includes, p4_path]
+
+            result = subprocess.run(
+                command,
+                cwd=dirs.petr4,
+                stdout=log_f,
+                stderr=log_f,
+            )
+
+            # 42 on success, 6 on failure
+            if typ == StaticTestType.POS:
+                if result.returncode == 42:
+                    results.append((p4_path, TestResult.PASS))
+                else:
+                    results.append((p4_path, TestResult.FAIL))
+            else:
+                if result.returncode == 6:
+                    results.append((p4_path, TestResult.PASS))
+                else:
+                    results.append((p4_path, TestResult.FAIL))
+
+    print(f"Subprocess logs written to {log_path}.")
+    results = patch_non_terminating_excludes_static(results, petr4_exclude)
+    dump_json(results, dirs.logs, f"typecheck-{typ.value}-")
+
+    return results
+
+
+############################### DYNAMIC ###############################
+
+
+def hol4p4_post_cmd(hol_test_suite_dir: str, dirs: Dirs) -> DynamicTestRecord:
+    """
+    This function contains everything that needs to happen after Holmake.
+    HOL4P4 may occasionally become stuck while running tests.
+
+    If the Holmake process is terminated (e.g. via SIGKILL), this function can
+    be used to generate test statistics up to the point where execution stopped.
+
+    Args:
+        hol_test_suite_dir: absolute path to test suite inside HOL4P4's p4_from_json directory
+    """
+    target_dir = Path(hol_test_suite_dir)
+    excluded_dir = target_dir.with_name(target_dir.name + ".excluded")
+
+    obj_dir = target_dir / ".hol" / "objs"
+    results: DynamicTestRecord = []
+
+    for f in excluded_dir.glob("*"):
+        if f.suffix == ".stf":
+            p4_path = target_dir / (f.stem + ".p4")
+
+            if p4_path.is_file():
+                p4_file = str(p4_path.resolve())
+                stf_file = str(f.resolve())
+
+                results.append((p4_file, stf_file, TestResult.SKIP))
+            else:
+                assert True, (
+                    f"Excluded STF file {f} does not have corresponding pair {p4_path}"
+                )
+
+        elif f.suffix == ".p4":
+            stf_path = target_dir / (f.stem + ".stf")
+
+            if stf_path.is_file():
+                p4_file = str(f.resolve())
+                stf_file = str(stf_path.resolve())
+
+                results.append((p4_file, stf_file, TestResult.SKIP))
+            else:
+                assert True, (
+                    f"Excluded P4 file {f} does not have corresponding pair {stf_path}"
+                )
+        else:
+            assert True, f"file with invalid name {f} in {excluded_dir}"
+
+    for p4_path, stf_path in get_p4_stf_pairs(hol_test_suite_dir):
+        p4_file_pathobj = Path(p4_path)
+        base_name = p4_file_pathobj.stem
+
+        theory_name = base_name.replace("-", "_")
+        theory_file = obj_dir / f"{theory_name}Theory.uo"
+
+        if theory_file.is_file():
+            results.append((p4_path, stf_path, TestResult.PASS))
+        else:
+            results.append((p4_path, stf_path, TestResult.FAIL))
+
+    dump_json(results, dirs.logs, "cleanup-")
+    return results
+
+
+def hol4p4_collect_test_results(dir: str, test_suite: TestSuite) -> DynamicTestRecord:
+    target_dir = Path(dir)
+    obj_dir = target_dir / ".hol" / "objs"
+    results = []
+
+    for p4_file, stf_file in test_suite.pairs:
+        if is_exclude_pair(test_suite.excluded, (p4_file, stf_file)):
+            results.append((p4_file, stf_file, TestResult.SKIP))
+            continue
+
+        p4_file_pathobj = Path(p4_file)
+        base_name = p4_file_pathobj.stem
+
+        theory_name = base_name.replace("-", "_")
+        theory_file = obj_dir / f"{theory_name}Theory.uo"
+
+        if theory_file.is_file():
+            results.append((p4_file, stf_file, TestResult.PASS))
+        else:
+            results.append((p4_file, stf_file, TestResult.FAIL))
+
+    return results
+
+
+def run_hol4p4_dynamic(suite_rel: str, dirs: Dirs) -> DynamicTestRecord:
+    """
+    Args:
+        suite_rel: relative suite path within testdata, e.g. "p4c/v1model"
+    """
+    print(f"\n=== HOL4P4 dynamic {suite_rel} ===")
+    hol_project_root = str(Path(dirs.hol4p4) / "hol" / "p4_from_json")
+    hol4p4_exclude   = str(Path(dirs.hol4p4) / "hol4p4.exclude")
+
+    src_dir        = Path(dirs.testdata) / suite_rel
+    hol_suite_name = suite_rel.replace("/", "-")   # e.g. "p4c-v1model"
+    test_suite_dir = Path(hol_project_root) / hol_suite_name
+
+    # patch all stfs in src_dir, which will end up in test_suite_dir
+    patch_directory(src_dir, test_suite_dir)
+
+    test_suite_path = str(test_suite_dir.resolve())
+    test_suite = read_test_suite(
+        test_suite_path,
+        dirs.excludes,
+        ignore_list=["static/limit"],
+        additional_list=[hol4p4_exclude],
+    )
+
+    # copy non-excluded files into a fresh directory for the batch run
+    filtered_dir = test_suite_dir.with_name(test_suite_dir.name + f".{get_time()}.filtered")
+    if filtered_dir.exists():
+        shutil.rmtree(filtered_dir)
+    filtered_dir.mkdir(parents=True, exist_ok=True)
+
+    copied = 0
+    for f in test_suite_dir.iterdir():
+        if f.is_file() and f.name not in test_suite.excluded:
+            shutil.copy2(f, filtered_dir / f.name)
+            copied += 1
+    print(f"Copied {copied} files to {filtered_dir} (excluded {len(test_suite.excluded)}).")
+
+    filtered_path = str(filtered_dir.resolve())
+
+    command = ["./run-tests.sh", filtered_path, dirs.includes]
+
+    log_path = Path(dirs.logs) / f"hol4p4-{hol_suite_name}-{get_time()}.log"
+    with open(log_path, "w") as log_f:
+        subprocess.run(command, cwd=hol_project_root, stdout=log_f, stderr=log_f)
+    print(f"Subprocess logs written to {log_path}.")
+
+    results = hol4p4_collect_test_results(filtered_path, test_suite)
+    results = patch_non_terminating_excludes_dynamic(results, hol4p4_exclude)
+    dump_json(results, dirs.logs, hol_suite_name)
+    return results
+
+
+def run_p4spectec_dynamic(
+    test_suite: TestSuite, arch_: Arch, log_label: str, dirs: Dirs
+) -> DynamicTestRecord:
+    print(f"\n=== P4-SpecTec dynamic {log_label} ({len(test_suite.pairs)} pairs) ===")
+    arch = arch_.value.lower()
+
+    tests = test_suite.pairs
+    excluded = test_suite.excluded
+
+    results: DynamicTestRecord = []
+
+    watsup_files = sorted(glob.glob(f"{dirs.spectec}/spec-concrete/*/*.watsup"))
+
+    log_path = Path(dirs.logs) / f"p4spectec-{log_label}-{get_time()}.log"
+    with open(log_path, "w") as log_f:
+        for p4_path, stf_path in tests:
+            if is_exclude_pair(excluded, (p4_path, stf_path)):
+                results.append((p4_path, stf_path, TestResult.SKIP))
+                continue
+
+            command = (
+                ["./p4spectec-test", "sim"]
+                + watsup_files
+                + [
+                    "-i",
+                    dirs.includes,
+                    "-arch",
+                    arch,
+                    "-sl",
+                    "-p",
+                    p4_path,
+                    "-stf",
+                    stf_path,
+                ]
+            )
+
+            result = subprocess.run(
+                command,
+                cwd=dirs.spectec,
+                stdout=log_f,
+                stderr=log_f,
+            )
+
+            # 42 on success, 6 on failure
+            if result.returncode == 42:
+                results.append((p4_path, stf_path, TestResult.PASS))
+            else:
+                results.append((p4_path, stf_path, TestResult.FAIL))
+
+    print(f"Subprocess logs written to {log_path}.")
+    dump_json(results, dirs.logs, log_label)
+
+    return results
+
+
+def run_petr4_dynamic(test_suite: TestSuite, log_label: str, dirs: Dirs) -> DynamicTestRecord:
+    print(f"\n=== Petr4 dynamic {log_label} ({len(test_suite.pairs)} pairs) ===")
+    tests = test_suite.pairs
+    excluded = test_suite.excluded
+
+    results: DynamicTestRecord = []
+
+    log_path = Path(dirs.logs) / f"petr4-{log_label}-{get_time()}.log"
+    with open(log_path, "w") as log_f:
+        for p4_path, stf_path in tests:
+            if is_exclude_pair(excluded, (p4_path, stf_path)):
+                results.append((p4_path, stf_path, TestResult.SKIP))
+                continue
+
+            command = [
+                "./_opam/bin/petr4",
+                "stf",
+                "-I",
+                dirs.includes,
+                p4_path,
+                "-stf",
+                stf_path,
+            ]
+
+            result = subprocess.run(
+                command,
+                cwd=dirs.petr4,
+                stdout=log_f,
+                stderr=log_f,
+            )
+
+            # 42 on success, 6 on failure
+            if result.returncode == 42:
+                results.append((p4_path, stf_path, TestResult.PASS))
+            else:
+                results.append((p4_path, stf_path, TestResult.FAIL))
+
+    print(f"Subprocess logs written to {log_path}.")
+    dump_json(results, dirs.logs, log_label)
+
+    return results
+
+
+############################### PATCH UTIL ###############################
+def patch_non_terminating_excludes_static(
+    results: StaticTestRecord, exclude_file: str
+) -> StaticTestRecord:
+    """
+    In Petr4 and HOL4P4, there are certain tests that do not terminate.
+    As a result, we exclude them using a project-specific .exclude file.
+    After testing, we find and mark them as failed.
+    """
+
+    p4_files = {Path(t[0]).name for t in results}
+    exclude_pathobj = Path(exclude_file).resolve()
+
+    if not exclude_pathobj.is_file():
+        return results
+
+    exclude_candidate = set()
+    with exclude_pathobj.open("r") as f:
+        for line in f:
+            entry = line.strip()
+            if not entry:
+                continue
+
+            entry_path = Path(entry)
+
+            stem = entry_path.stem
+            suffix = entry_path.suffix
+
+            if "testdata/p4testgen" in entry and suffix == ".stf":
+                continue
+            elif suffix == ".p4":
+                if f"{stem}.p4" in p4_files:
+                    exclude_candidate.add(f"{stem}.p4")
+
+    for idx, result_entry in enumerate(results):
+        p4, _ = result_entry
+        if Path(p4).name in exclude_candidate:
+            results[idx] = (p4, TestResult.FAIL)  # pyright: ignore
+
+    return results
+
+
+def patch_non_terminating_excludes_dynamic(
+    results: DynamicTestRecord, exclude_file: str
+) -> DynamicTestRecord:
+    """
+    In Petr4 and HOL4P4, there are certain tests that do not terminate.
+    As a result, we exclude them using a project-specific .exclude file.
+    After testing, we find and mark them as failed.
+    """
+
+    p4_files = {Path(t[0]).name for t in results}
+    stf_files = {Path(t[1]).name for t in results}
+    exclude_pathobj = Path(exclude_file).resolve()
+
+    if not exclude_pathobj.is_file():
+        return results
+
+    exclude_candidate = set()
+    with exclude_pathobj.open("r") as f:
+        for line in f:
+            entry = line.strip()
+            if not entry:
+                continue
+
+            entry_path = Path(entry)
+
+            stem = entry_path.stem
+            suffix = entry_path.suffix
+
+            if "testdata/p4testgen" in entry and suffix == ".stf":
+                match = re.match(r"(.+)_(\d+)$", stem)
+                if match:
+                    target_p4 = f"{match.group(1)}__{match.group(2)}.p4"
+                    if target_p4 in p4_files:
+                        exclude_candidate.add(target_p4)
+                elif f"{stem}.stf" in stf_files:
+                    exclude_candidate.add(f"{stem}.stf")
+
+            elif suffix == ".p4":
+                if f"{stem}.p4" in p4_files:
+                    exclude_candidate.add(f"{stem}.p4")
+
+                family_pattern = re.compile(rf"^{re.escape(stem)}__\d+\.p4$")
+                for filename in stf_files:
+                    if family_pattern.match(filename):
+                        exclude_candidate.add(filename)
+
+            elif suffix == ".stf":
+                if f"{stem}.stf" in stf_files:
+                    exclude_candidate.add(f"{stem}.stf")
+
+    for idx, result_entry in enumerate(results):
+        p4, stf, _ = result_entry
+        if Path(p4).name in exclude_candidate or Path(stf).name in exclude_candidate:
+            results[idx] = (p4, stf, TestResult.FAIL)  # pyright: ignore
+
+    return results
+
+
+############################### CSV UTILS ###############################
+
+
+def static_test_records_to_csv(
+    records: list[tuple[str, StaticTestRecord]], logs_dir: str, log_label=""
+) -> None:
+    if not records:
+        raise ValueError("No records provided")
+
+    if log_label != "":
+        log_label = log_label if log_label.endswith("-") else log_label + "-"
+
+    # --- 1. basic size check ---
+    sizes = [len(r[1]) for r in records]
+    if len(set(sizes)) != 1:
+        raise ValueError(f"Record sizes do not match: {sizes}")
+
+    # --- 2. build mapping: project -> {p4_filename -> TestResult} ---
+    project_maps: dict[str, tuple[dict[str, TestResult], int]] = {}
+    project_names: list[str] = []
+
+    for project, rec in records:
+        project_names.append(project)
+
+        mapping: dict[str, TestResult] = {}
+        skip_count = 0
+
+        for p4_path, result in rec:
+            filename = Path(p4_path).name
+
+            if filename in mapping:
+                raise ValueError(f"Duplicate filename in {project}: {filename}")
+
+            mapping[filename] = result
+
+            if result == TestResult.SKIP:
+                skip_count += 1
+
+        project_maps[project] = (mapping, skip_count)
+
+    # --- 3. check filename alignment ---
+    all_filename_sets = [set(m[0].keys()) for m in project_maps.values()]
+    first_set = all_filename_sets[0]
+
+    for label in all_filename_sets[1:]:
+        if label != first_set:
+            raise ValueError("Filenames are not aligned across projects")
+
+    filenames = sorted(first_set)
+
+    # --- 4. check SKIP counts ---
+    skip_counts = [m[1] for m in project_maps.values()]
+    if len(set(skip_counts)) != 1:
+        raise ValueError(f"SKIP counts do not match: {skip_counts}")
+
+    # --- 5. write CSV ---
+    header = ["P4"] + project_names
+
+    csv_path = str(Path(logs_dir) / f"{log_label}static-results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        print("Generating CSV...")
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        for filename in filenames:
+            row = [filename]
+
+            for project in project_names:
+                result = project_maps[project][0][filename]
+                row.append(result)
+
+            writer.writerow(row)
+
+        print(f"Comparison result written to {csv_path}.")
+
+
+def dynamic_test_records_to_csv(
+    records: list[tuple[str, DynamicTestRecord]], logs_dir: str, log_label=""
+) -> None:
+    if not records:
+        raise ValueError("No records provided")
+
+    if log_label != "":
+        log_label = log_label if log_label.endswith("-") else log_label + "-"
+
+    # --- 1. basic size check ---
+    sizes = [len(r[1]) for r in records]
+    if len(set(sizes)) != 1:
+        raise ValueError(f"Record sizes do not match: {sizes}")
+
+    # --- 2. build mapping: project -> {p4_filename -> (stf_filename, TestResult)} ---
+    project_maps: dict[str, tuple[dict[str, tuple[str, TestResult]], int]] = {}
+    project_names: list[str] = []
+
+    for project, rec in records:
+        project_names.append(project)
+
+        mapping: dict[str, tuple[str, TestResult]] = {}
+        skip_count = 0
+
+        for p4_path, stf_path, result in rec:
+            p4_name = Path(p4_path).name
+            stf_name = Path(stf_path).name
+
+            if p4_name in mapping:
+                raise ValueError(f"Duplicate filename in {project}: {p4_name}")
+
+            mapping[p4_name] = (stf_name, result)
+
+            if result == TestResult.SKIP:
+                skip_count += 1
+
+        project_maps[project] = (mapping, skip_count)
+
+    # --- 3. check filename alignment (based on p4 only) ---
+    all_filename_sets = [set(m[0].keys()) for m in project_maps.values()]
+    first_set = all_filename_sets[0]
+
+    for s in all_filename_sets[1:]:
+        if s != first_set:
+            raise ValueError("Filenames are not aligned across projects")
+
+    filenames = sorted(first_set)
+
+    # --- 4. check SKIP counts ---
+    skip_counts = [m[1] for m in project_maps.values()]
+    if len(set(skip_counts)) != 1:
+        raise ValueError(f"SKIP counts do not match: {skip_counts}")
+
+    # --- 5. ensure STF consistency across projects ---
+    for filename in filenames:
+        stf_set = {project_maps[project][0][filename][0] for project in project_names}
+        if len(stf_set) != 1:
+            raise ValueError(f"STF mismatch for {filename}: {stf_set}")
+
+    # --- 6. write CSV ---
+    header = ["P4", "STF"] + project_names
+
+    csv_path = str(Path(logs_dir) / f"{log_label}dynamic-results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        print("Generating CSV...")
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        for filename in filenames:
+            # STF is guaranteed consistent, so take from first project
+            stf_name = project_maps[project_names[0]][0][filename][0]
+
+            row = [filename, stf_name]
+
+            for project in project_names:
+                result = project_maps[project][0][filename][1]
+                row.append(result)
+
+            writer.writerow(row)
+
+        print(f"Comparison result written to {csv_path}.")
+
+
+############################### TEST UTILS ###############################
+
+
+def run_p4spectec_static_all(dirs: Dirs, suites: Suites):
+    """
+    Run all typecheck tests (positive and negative) on P4-SpecTec
+    """
+    run_p4spectec_static(suites.positive, StaticTestType.POS, dirs)
+    run_p4spectec_static(suites.negative, StaticTestType.NEG, dirs)
+
+
+def run_petr4_static_all(dirs: Dirs, suites: Suites):
+    """
+    Run all typecheck tests (positive and negative) on Petr4
+    """
+    run_petr4_static(suites.positive, StaticTestType.POS, dirs)
+    run_petr4_static(suites.negative, StaticTestType.NEG, dirs)
+
+
+def run_static_all(dirs: Dirs, suites: Suites):
+    """
+    Run all typecheck tests (positive and negative) on P4-SpecTec and Petr4
+    """
+    run_p4spectec_static_all(dirs, suites)
+    run_petr4_static_all(dirs, suites)
+
+
+def run_p4spectec_dynamic_by_test_suite(suite: str, dirs: Dirs, suites: Suites):
+    if suite == "v1model":
+        run_p4spectec_dynamic(suites.p4c_v1model, Arch.V1MODEL, "p4c-v1model", dirs)
+    elif suite == "ebpf":
+        run_p4spectec_dynamic(suites.p4c_ebpf, Arch.EBPF, "p4c-ebpf", dirs)
+    elif suite == "v1model+":
+        run_p4spectec_dynamic(suites.p4testgen_v1model, Arch.V1MODEL, "p4testgen-v1model", dirs)
+    elif suite == "ebpf+":
+        run_p4spectec_dynamic(suites.p4testgen_ebpf, Arch.EBPF, "p4testgen-ebpf", dirs)
+    else:
+        raise ValueError(f"Invalid test suite {suite} for P4-SpecTec")
+
+
+def run_petr4_dynamic_all(dirs: Dirs, suites: Suites):
+    """
+    Execute the V1Model, eBPF, V1Model+ and eBPF+ test suites on Petr4
+    """
+    run_petr4_dynamic(suites.p4c_v1model,       "p4c-v1model",       dirs)
+    run_petr4_dynamic(suites.p4c_ebpf,           "p4c-ebpf",           dirs)
+    run_petr4_dynamic(suites.p4testgen_v1model,  "p4testgen-v1model",  dirs)
+    run_petr4_dynamic(suites.p4testgen_ebpf,     "p4testgen-ebpf",     dirs)
+
+
+def run_hol4p4_dynamic_all(dirs: Dirs):
+    """
+    Execute the V1Model, eBPF, V1Model+ and eBPF+ test suites on HOL4P4
+
+    It is not recommended to run this function, since HOL4P4 can
+    take a *very* long time to execute
+    """
+    run_hol4p4_dynamic("p4c/v1model",       dirs)
+    run_hol4p4_dynamic("p4c/ebpf",           dirs)
+    run_hol4p4_dynamic("p4testgen/v1model",  dirs)
+    run_hol4p4_dynamic("p4testgen/ebpf",     dirs)
+
+
+def run_hol4p4_dynamic_by_test_suite(suite: str, dirs: Dirs):
+    if suite == "v1model":
+        run_hol4p4_dynamic("p4c/v1model", dirs)
+    elif suite == "ebpf":
+        run_hol4p4_dynamic("p4c/ebpf", dirs)
+    elif suite == "v1model+":
+        run_hol4p4_dynamic("p4testgen/v1model", dirs)
+    elif suite == "ebpf+":
+        run_hol4p4_dynamic("p4testgen/ebpf", dirs)
+    else:
+        raise ValueError(f"Invalid test suite {suite} for HOL4P4")
+
+
+def run_petr4_dynamic_by_test_suite(suite: str, dirs: Dirs, suites: Suites):
+    if suite == "v1model":
+        run_petr4_dynamic(suites.p4c_v1model,      "p4c-v1model",      dirs)
+    elif suite == "ebpf":
+        run_petr4_dynamic(suites.p4c_ebpf,          "p4c-ebpf",          dirs)
+    elif suite == "v1model+":
+        run_petr4_dynamic(suites.p4testgen_v1model, "p4testgen-v1model", dirs)
+    elif suite == "ebpf+":
+        run_petr4_dynamic(suites.p4testgen_ebpf,    "p4testgen-ebpf",    dirs)
+    else:
+        raise ValueError(f"Invalid test suite {suite} for Petr4")
+
+
+def compare_dynamic_test_results(suite: str, dirs: Dirs, suites: Suites):
+    if suite == "v1model":
+        p4spectec_result = run_p4spectec_dynamic(
+            suites.p4c_v1model, Arch.V1MODEL, "p4c-v1model", dirs
+        )
+        petr4_result  = run_petr4_dynamic(suites.p4c_v1model, "p4c-v1model", dirs)
+        hol4p4_result = run_hol4p4_dynamic("p4c/v1model", dirs)
+    elif suite == "ebpf":
+        p4spectec_result = run_p4spectec_dynamic(
+            suites.p4c_ebpf, Arch.EBPF, "p4c-ebpf", dirs
+        )
+        petr4_result  = run_petr4_dynamic(suites.p4c_ebpf, "p4c-ebpf", dirs)
+        hol4p4_result = run_hol4p4_dynamic("p4c/ebpf", dirs)
+    elif suite == "v1model+":
+        p4spectec_result = run_p4spectec_dynamic(
+            suites.p4testgen_v1model, Arch.V1MODEL, "p4testgen-v1model", dirs
+        )
+        petr4_result  = run_petr4_dynamic(suites.p4testgen_v1model, "p4testgen-v1model", dirs)
+        hol4p4_result = run_hol4p4_dynamic("p4testgen/v1model", dirs)
+    elif suite == "ebpf+":
+        p4spectec_result = run_p4spectec_dynamic(
+            suites.p4testgen_ebpf, Arch.EBPF, "p4testgen-ebpf", dirs
+        )
+        petr4_result  = run_petr4_dynamic(suites.p4testgen_ebpf, "p4testgen-ebpf", dirs)
+        hol4p4_result = run_hol4p4_dynamic("p4testgen/ebpf", dirs)
+    else:
+        raise ValueError(f"Invalid test suite {suite}")
+
+    results = [
+        ("P4-Spectec", p4spectec_result),
+        ("Petr4",      petr4_result),
+        ("HOL4P4",     hol4p4_result),
+    ]
+
+    dynamic_test_records_to_csv(results, dirs.logs, suite)
+
+
+def dynamic_tests_generate_csv_from_fs(base: list[tuple[str, str]], test: str, logs_dir: str):
+    p4c_v1model_test_records = [
+        (project, read_dynamic_test_record(filename + f"{test}.json"))
+        for project, filename in base
+    ]
+    dynamic_test_records_to_csv(p4c_v1model_test_records, logs_dir, test)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="P4 Test CLI")
+
+    # --- shared directory arguments ---
+    parser.add_argument(
+        "--spectec", required=True, metavar="DIR",
+        help="p4-spectec project root (contains p4spectec-test binary and spec-concrete/)",
+    )
+    parser.add_argument(
+        "--petr4", required=True, metavar="DIR",
+        help="petr4 project root (contains _opam/bin/petr4 and petr4.exclude)",
+    )
+    parser.add_argument(
+        "--hol4p4", required=True, metavar="DIR",
+        help="HOL4P4 project root (contains hol/p4_from_json/ and hol4p4.exclude)",
+    )
+    parser.add_argument(
+        "-i", "--includes", required=True, metavar="DIR",
+        help="p4 include path passed as -i / -I to all tools",
+    )
+    parser.add_argument(
+        "-e", "--excludes", required=True, metavar="DIR",
+        help="Root excludes directory containing .exclude files",
+    )
+    parser.add_argument(
+        "-t", "--testdata", required=True, metavar="DIR",
+        help="Root testdata directory (contains p4_16_samples/, p4_16_errors/, p4c/, p4testgen/)",
+    )
+    parser.add_argument(
+        "-l", "--logs", required=True, metavar="DIR",
+        help="Directory where all JSON and CSV output will be written",
+    )
+
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    # --- static ---
+    static_parser = subparsers.add_parser("static", help="Run static tests")
+    static_parser.add_argument(
+        "target",
+        choices=["p4spectec", "petr4", "compare"],
+        help="Static target",
+    )
+    static_parser.add_argument(
+        "suite",
+        choices=["pos", "neg"],
+        help="Test suite",
+    )
+
+    # --- dynamic ---
+    dynamic_parser = subparsers.add_parser("dynamic", help="Run dynamic tests")
+    dynamic_parser.add_argument(
+        "project",
+        choices=["p4spectec", "petr4", "hol4p4", "compare"],
+        help="Project",
+    )
+    dynamic_parser.add_argument(
+        "suite",
+        choices=["v1model", "ebpf", "v1model+", "ebpf+"],
+        help="Test suite",
+    )
+
+    args = parser.parse_args()
+
+    dirs = Dirs(
+        spectec  = str(Path(args.spectec).resolve()),
+        petr4    = str(Path(args.petr4).resolve()),
+        hol4p4   = str(Path(args.hol4p4).resolve()),
+        includes = str(Path(args.includes).resolve()),
+        excludes = str(Path(args.excludes).resolve()),
+        testdata = str(Path(args.testdata).resolve()),
+        logs     = str(Path(args.logs).resolve() / "rq3"),
+    )
+
+    Path(dirs.logs).mkdir(parents=True, exist_ok=True)
+
+    excludes_static = str(Path(dirs.excludes) / "static")
+    petr4_exclude   = str(Path(dirs.petr4) / "petr4.exclude")
+
+    suites = Suites(
+        positive=read_test_suite(
+            str(Path(dirs.testdata) / "p4_16_samples"),
+            excludes_static,
+            ignore_list=["limit/"],
+        ),
+        negative=read_test_suite(
+            str(Path(dirs.testdata) / "p4_16_errors"),
+            excludes_static,
+            ignore_list=["limit/"],
+        ),
+        negative_petr4=read_test_suite(
+            str(Path(dirs.testdata) / "p4_16_errors"),
+            excludes_static,
+            ignore_list=["limit/"],
+            additional_list=[petr4_exclude],
+        ),
+        p4c_v1model=read_test_suite(
+            str(Path(dirs.testdata) / "p4c" / "v1model"),
+            dirs.excludes,
+            ignore_list=["static/limit/"],
+        ),
+        p4c_ebpf=read_test_suite(
+            str(Path(dirs.testdata) / "p4c" / "ebpf"),
+            dirs.excludes,
+            ignore_list=["static/limit/"],
+        ),
+        p4testgen_v1model=read_test_suite(
+            str(Path(dirs.testdata) / "p4testgen" / "v1model"),
+            dirs.excludes,
+            ignore_list=["static/limit/"],
+        ),
+        p4testgen_ebpf=read_test_suite(
+            str(Path(dirs.testdata) / "p4testgen" / "ebpf"),
+            dirs.excludes,
+            ignore_list=["static/limit/"],
+        ),
+    )
+
+    # --- dispatch ---
+    if args.mode == "static":
+        if args.target == "p4spectec":
+            if args.suite == "pos":
+                run_p4spectec_static(suites.positive, StaticTestType.POS, dirs)
+            elif args.suite == "neg":
+                run_p4spectec_static(suites.negative, StaticTestType.NEG, dirs)
+            else:
+                raise ValueError(f"Invalid suite {args.suite}. Must be one of pos|neg")
+
+        elif args.target == "petr4":
+            if args.suite == "pos":
+                run_petr4_static(suites.positive, StaticTestType.POS, dirs)
+            elif args.suite == "neg":
+                run_petr4_static(suites.negative_petr4, StaticTestType.NEG, dirs)
+            else:
+                raise ValueError(f"Invalid suite {args.suite}. Must be one of pos|neg")
+
+        elif args.target == "compare":
+            if args.suite == "pos":
+                p4spectec_result = run_p4spectec_static(
+                    suites.positive, StaticTestType.POS, dirs
+                )
+                petr4_result = run_petr4_static(suites.positive, StaticTestType.POS, dirs)
+                results = [("P4-SpecTec", p4spectec_result), ("Petr4", petr4_result)]
+                static_test_records_to_csv(results, dirs.logs, "positive")
+
+            elif args.suite == "neg":
+                p4spectec_result = run_p4spectec_static(
+                    suites.negative, StaticTestType.NEG, dirs
+                )
+                petr4_result = run_petr4_static(
+                    suites.negative_petr4, StaticTestType.NEG, dirs
+                )
+                results = [("P4-SpecTec", p4spectec_result), ("Petr4", petr4_result)]
+                static_test_records_to_csv(results, dirs.logs, "negative")
+
+            else:
+                raise ValueError(f"Invalid suite {args.suite}. Must be one of pos|neg")
+
+    elif args.mode == "dynamic":
+        if args.project == "p4spectec":
+            run_p4spectec_dynamic_by_test_suite(args.suite, dirs, suites)
+        elif args.project == "petr4":
+            run_petr4_dynamic_by_test_suite(args.suite, dirs, suites)
+        elif args.project == "hol4p4":
+            run_hol4p4_dynamic_by_test_suite(args.suite, dirs)
+        elif args.project == "compare":
+            compare_dynamic_test_results(args.suite, dirs, suites)
+
+
+if __name__ == "__main__":
+    main()
