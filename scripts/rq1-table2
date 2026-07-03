@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Print Table 2 (categorization of excluded tests) from the .exclude files
+under `testdata/excludes/{static,dynamic}`. Does not run any tests."""
+
+import argparse
+from pathlib import Path
+
+CATEGORIES = [
+    ("future", "Future"),
+    ("p4spec", "P4Spec"),
+    ("p4c", "P4C"),
+    ("specific", "Specific"),
+]
+
+
+def count_static(exclude_file: Path) -> int:
+    """Sum of positive (p4_16_samples) and negative (p4_16_errors) entries."""
+    pos = neg = 0
+    for line in exclude_file.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "p4_16_samples" in line:
+            pos += 1
+        elif "p4_16_errors" in line:
+            neg += 1
+    return pos + neg
+
+
+def count_dynamic(exclude_file: Path) -> int:
+    """Sum of .p4 and .stf entries."""
+    p4 = stf = 0
+    for line in exclude_file.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.endswith(".p4"):
+            p4 += 1
+        elif line.endswith(".stf"):
+            stf += 1
+    return p4 + stf
+
+
+def gather_category(excludes_root: Path, category: str) -> list[tuple[str, int, int]]:
+    static_dir = excludes_root / "static" / category
+    dynamic_dir = excludes_root / "dynamic" / category
+
+    static_files = {f.name: f for f in static_dir.glob("*.exclude")} if static_dir.is_dir() else {}
+    dynamic_files = {f.name: f for f in dynamic_dir.glob("*.exclude")} if dynamic_dir.is_dir() else {}
+
+    names = sorted(set(static_files) | set(dynamic_files))
+    rows = []
+    for name in names:
+        st = count_static(static_files[name]) if name in static_files else 0
+        dy = count_dynamic(dynamic_files[name]) if name in dynamic_files else 0
+        rows.append((name, st, dy))
+    return rows
+
+
+def print_table(header: tuple, cell_rows: list[tuple], title: str):
+    widths = [max(len(header[i]), *(len(row[i]) for row in cell_rows)) for i in range(len(header))]
+
+    def fmt_row(cells):
+        return "  ".join(c.rjust(widths[i]) if i > 0 else c.ljust(widths[i]) for i, c in enumerate(cells))
+
+    print()
+    print(title)
+    print(fmt_row(header))
+    print("  ".join("-" * w for w in widths))
+    for cells in cell_rows:
+        print(fmt_row(cells))
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Print Table 2 (categorization of excluded tests) from testdata/excludes."
+    )
+    parser.add_argument(
+        "-e", "--excludes", required=True, metavar="DIR",
+        help="Root excludes directory containing static/ and dynamic/ .exclude subdirectories",
+    )
+    args = parser.parse_args()
+
+    excludes_root = Path(args.excludes).resolve()
+    if not excludes_root.is_dir():
+        raise SystemExit(f"{excludes_root} does not exist.")
+
+    print()
+    print("Table 2: Categorization of excluded tests in Future, P4Spec, P4C, and Specific.")
+
+    grand_st = grand_dy = 0
+    summary_rows = []
+    for category, display_name in CATEGORIES:
+        rows = gather_category(excludes_root, category)
+        cat_st = sum(st for _, st, _ in rows)
+        cat_dy = sum(dy for _, _, dy in rows)
+        grand_st += cat_st
+        grand_dy += cat_dy
+        summary_rows.append((display_name, str(cat_st), str(cat_dy)))
+
+        cell_rows = [(name, str(st), str(dy)) for name, st, dy in rows]
+        cell_rows.append(("Total", str(cat_st), str(cat_dy)))
+        print_table(("Sub-category", "St", "Dy"), cell_rows, f"[{display_name}]")
+
+    summary_rows.append(("Total", str(grand_st), str(grand_dy)))
+    print_table(("Category", "St", "Dy"), summary_rows, "[Summary]")
+
+
+if __name__ == "__main__":
+    main()

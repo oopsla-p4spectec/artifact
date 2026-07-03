@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Print Table 4 (P4 interpreter backend results) from JSON logs already
+produced by `scripts/rq1`. Does not run any tests."""
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+# (table row name, JSON log filename prefix written by scripts/rq1)
+DYNAMIC_SUITES = [
+    ("V1Model",  "p4c-v1model-"),
+    ("V1Model+", "p4testgen-v1model-"),
+    ("eBPF",     "p4c-ebpf-"),
+    ("eBPF+",    "p4testgen-ebpf-"),
+    ("PSA",      "p4c-psa-"),
+]
+SUITE_CHOICES = [name for name, _ in DYNAMIC_SUITES]
+GROUP_BREAKS = {"V1Model+", "eBPF+"}  # print a separator after these rows
+
+
+def find_latest_log(logs_dir: Path, prefix: str) -> Path | None:
+    matches = sorted(logs_dir.glob(f"{prefix}*.json"))
+    return matches[-1] if matches else None
+
+
+def parse_exclude_entries(excludes_root: Path) -> list[tuple[str, str, bool]]:
+    """Returns (stem, suffix, is_p4testgen_stf) for every line in every .exclude file under excludes_root."""
+    entries = []
+    if not excludes_root.is_dir():
+        return entries
+    for root, _, files in os.walk(excludes_root):
+        for file in files:
+            if not file.endswith(".exclude"):
+                continue
+            for line in (Path(root) / file).read_text().splitlines():
+                entry = line.strip()
+                if not entry:
+                    continue
+                p = Path(entry)
+                is_p4testgen_stf = "testdata/p4testgen" in entry and p.suffix == ".stf"
+                entries.append((p.stem, p.suffix, is_p4testgen_stf))
+    return entries
+
+
+def basename_excluded_by(name: str, entries: list[tuple[str, str, bool]]) -> bool:
+    """Mirrors the matching rules in scripts/rq1's read_test_suite, but against a single known basename."""
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    for e_stem, e_suffix, is_p4testgen_stf in entries:
+        if is_p4testgen_stf:
+            match = re.match(r"(.+)_(\d+)$", e_stem)
+            if match:
+                if name == f"{match.group(1)}__{match.group(2)}.p4":
+                    return True
+            elif name == f"{e_stem}.stf":
+                return True
+        elif e_suffix == ".p4" and suffix == ".p4":
+            if stem == e_stem or re.match(rf"^{re.escape(e_stem)}__\d+$", stem):
+                return True
+        elif suffix == e_suffix and stem == e_stem:
+            return True
+    return False
+
+
+def tally(
+    log_path: Path | None,
+    static_entries: list[tuple[str, str, bool]],
+    dynamic_entries: list[tuple[str, str, bool]],
+    patches_root: Path | None,
+) -> tuple[int, int, int, int, int, int] | tuple[None, None, None, None, None, None]:
+    if log_path is None:
+        return (None, None, None, None, None, None)
+    results = json.loads(log_path.read_text())
+    npass = npatched = nfail = nexcl_st = nexcl_dy = 0
+    for p4_path, stf_path, outcome in results:
+        if outcome == "PASS":
+            npass += 1
+            if patches_root is not None and (
+                Path(p4_path).is_relative_to(patches_root)
+                or Path(stf_path).is_relative_to(patches_root)
+            ):
+                npatched += 1
+        elif outcome == "FAIL":
+            nfail += 1
+        else:  # EXCLUDE
+            p4_name = Path(p4_path).name
+            stf_name = Path(stf_path).name
+            if basename_excluded_by(p4_name, static_entries) or basename_excluded_by(stf_name, static_entries):
+                nexcl_st += 1
+            elif basename_excluded_by(p4_name, dynamic_entries) or basename_excluded_by(stf_name, dynamic_entries):
+                nexcl_dy += 1
+    return npass, npatched, nfail, nexcl_st, nexcl_dy, len(results)
+
+
+def print_table(rows: list[tuple[str, int, int, int, int, int, int]]):
+    header = ("Target", "Pass (Patched)", "Fail", "Excl. Static", "Excl. Dynamic", "Total")
+    cell_rows = [
+        (name, "N/A", "N/A", "N/A", "N/A", "N/A")
+        if npass is None
+        else (name, f"{npass} ({npatched})", str(nfail), str(nexcl_st), str(nexcl_dy), str(total))
+        for name, npass, npatched, nfail, nexcl_st, nexcl_dy, total in rows
+    ]
+    widths = [max(len(header[i]), *(len(row[i]) for row in cell_rows)) for i in range(len(header))]
+
+    def fmt_row(cells):
+        return "  ".join(c.rjust(widths[i]) if i > 0 else c.ljust(widths[i]) for i, c in enumerate(cells))
+
+    total_width = sum(widths) + 2 * (len(widths) - 1)
+
+    print()
+    print("Table 4: P4 interpreter backend results.")
+    print(fmt_row(header))
+    print("  ".join("-" * w for w in widths))
+    for row, cells in zip(rows, cell_rows):
+        print(fmt_row(cells))
+        if row[0] in GROUP_BREAKS:
+            print("-" * total_width)
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Print Table 4 (P4 interpreter backend results) from scripts/rq1's JSON logs."
+    )
+    parser.add_argument(
+        "-l", "--logs", required=True, metavar="DIR",
+        help="Root logs directory previously passed to scripts/rq1 (reads DIR/rq1/*.json)",
+    )
+    parser.add_argument(
+        "-e", "--excludes", required=True, metavar="DIR",
+        help="Root excludes directory containing .exclude files, used to split exclusions into Static/Dynamic",
+    )
+    parser.add_argument(
+        "-p", "--patches", default=None, metavar="DIR",
+        help="Directory of patched test files (same one passed to scripts/rq1), used for the '(Patched)' count",
+    )
+    parser.add_argument(
+        "-s", "--suites", nargs="+", choices=SUITE_CHOICES, default=SUITE_CHOICES,
+        metavar="SUITE",
+        help=f"Test suites to include (default: all). Choices: {', '.join(SUITE_CHOICES)}",
+    )
+    args = parser.parse_args()
+
+    logs_dir = Path(args.logs).resolve() / "rq1"
+    if not logs_dir.is_dir():
+        print(f"Warning: {logs_dir} does not exist. Run scripts/rq1 first.", file=sys.stderr)
+
+    excludes_dir = Path(args.excludes).resolve()
+    static_entries = parse_exclude_entries(excludes_dir / "static")
+    dynamic_entries = parse_exclude_entries(excludes_dir / "dynamic")
+    patches_root = Path(args.patches).resolve() if args.patches else None
+
+    prefixes = dict(DYNAMIC_SUITES)
+    rows = []
+    for name in SUITE_CHOICES:
+        if name not in args.suites:
+            continue
+        log_path = find_latest_log(logs_dir, prefixes[name])
+        rows.append((name, *tally(log_path, static_entries, dynamic_entries, patches_root)))
+
+    print_table(rows)
+
+
+if __name__ == "__main__":
+    main()

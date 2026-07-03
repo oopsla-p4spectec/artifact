@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Print Figure 16 (Performance comparison of IL and SL interpreters) from
+time.log already produced by `scripts/rq2`. Does not run any benchmarks."""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+SUITE_CHOICES = ["POS", "V1Model+"]
+VARIANT_CHOICES = ["IL-det", "IL", "SL-det", "SL"]
+
+LINE_RE = re.compile(r"^(.+) runtime: ([\d.]+)s$")
+
+
+def parse_time_log(path: Path) -> dict[tuple[str, str], float]:
+    if not path.is_file():
+        print(f"Warning: {path} does not exist. Run scripts/rq2 first.", file=sys.stderr)
+        return {}
+
+    metrics: dict[tuple[str, str], float] = {}
+    for line in path.read_text().splitlines():
+        m = LINE_RE.match(line.strip())
+        if not m:
+            continue
+        label, seconds = m.group(1), float(m.group(2))
+        for suite in SUITE_CHOICES:
+            if label.startswith(suite + "-"):
+                variant = label[len(suite) + 1:]
+                metrics[(suite, variant)] = seconds
+                break
+
+    return metrics
+
+
+def print_table(rows: list[tuple[str, ...]], suites: list[str]):
+    header = ("", *(f"{s} Time (s)" for s in suites))
+    widths = [max(len(header[i]), *(len(row[i]) for row in rows)) for i in range(len(header))]
+
+    def fmt_row(cells):
+        return "  ".join(c.rjust(widths[i]) if i > 0 else c.ljust(widths[i]) for i, c in enumerate(cells))
+
+    print()
+    print("Figure 16: Performance comparison of IL and SL interpreters.")
+    print(fmt_row(header))
+    print("  ".join("-" * w for w in widths))
+    for cells in rows:
+        print(fmt_row(cells))
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Print Figure 16 (Performance comparison of IL and SL interpreters) from scripts/rq2's time.log."
+    )
+    parser.add_argument(
+        "-l", "--logs", required=True, metavar="DIR",
+        help="Root logs directory previously passed to scripts/rq2 (reads DIR/rq2/time.log)",
+    )
+    parser.add_argument(
+        "-s", "--suites", nargs="+", choices=SUITE_CHOICES, default=SUITE_CHOICES,
+        metavar="SUITE",
+        help=f"Test suites to include (default: all). Choices: {', '.join(SUITE_CHOICES)}",
+    )
+    parser.add_argument(
+        "-v", "--variants", nargs="+", choices=VARIANT_CHOICES, default=VARIANT_CHOICES,
+        metavar="VARIANT",
+        help=f"Interpreter variants to include (default: all). Choices: {', '.join(VARIANT_CHOICES)}",
+    )
+    args = parser.parse_args()
+
+    time_log = Path(args.logs).resolve() / "rq2" / "time.log"
+    metrics = parse_time_log(time_log)
+
+    suites = [s for s in SUITE_CHOICES if s in args.suites]
+    variants = [v for v in VARIANT_CHOICES if v in args.variants]
+
+    def cell(suite, variant):
+        if (suite, variant) not in metrics:
+            return "N/A"
+        return f"{metrics[(suite, variant)]:.3f}"
+
+    rows = [
+        (variant, *(cell(suite, variant) for suite in suites))
+        for variant in variants
+    ]
+
+    print_table(rows, suites)
+
+
+if __name__ == "__main__":
+    main()

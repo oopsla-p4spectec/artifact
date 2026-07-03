@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Run `make stat` + `p4spectec-stat` and print Table 5 (Comparison of EL,
+IL, and SL) from the paper as an ASCII table."""
+
+import argparse
+import glob
+import re
+import subprocess
+from pathlib import Path
+
+
+def run_stat(spectec_dir: str, logs_dir: Path) -> str:
+    cmd = ["make", "stat"]
+    print(f"+ {' '.join(cmd)}")
+    log_path = logs_dir / "make-stat.log"
+    with open(log_path, "w") as f:
+        subprocess.run(cmd, cwd=spectec_dir, check=True, stdout=f, stderr=f)
+    print(f"Results written to {log_path}.")
+
+    cmd = ["./p4spectec-stat"] + sorted(glob.glob(f"{spectec_dir}/spec/*/*.watsup"))
+    print(f"+ {' '.join(cmd)}")
+    log_path = logs_dir / "p4spectec-stat.log"
+    result = subprocess.run(cmd, cwd=spectec_dir, capture_output=True, text=True)
+    with open(log_path, "w") as f:
+        f.write(result.stdout)
+        f.write(result.stderr)
+    print(result.stdout, end="")
+    print(f"Results written to {log_path}.")
+
+    return result.stdout
+
+
+SECTION_HEADERS = {
+    "EL": re.compile(r"^EL has \[ (\d+) \] premises in rules$"),
+    "IL": re.compile(r"^IL has \[ (\d+) \] premises in rules$"),
+    "SL": re.compile(r"^SL has \[ (\d+) \] instructions$"),
+}
+
+FIELD_PATTERNS = {
+    "rule": re.compile(r"^- Rule (?:prems|instructions):\s*(\d+)$"),
+    "if": re.compile(r"^- If (?:prems|instructions):\s*(\d+)$"),
+    "let": re.compile(r"^- Let (?:prems|instructions):\s*(\d+)$"),
+}
+
+
+def parse_stat_log(text: str) -> dict[str, dict[str, int]]:
+    metrics: dict[str, dict[str, int]] = {}
+    section = None
+    for line in text.splitlines():
+        line = line.strip()
+
+        matched_header = False
+        for name, pattern in SECTION_HEADERS.items():
+            m = pattern.match(line)
+            if m:
+                section = name
+                metrics[section] = {"total": int(m.group(1))}
+                matched_header = True
+                break
+        if matched_header:
+            continue
+
+        if section is None:
+            continue
+        for field, pattern in FIELD_PATTERNS.items():
+            m = pattern.match(line)
+            if m:
+                metrics[section][field] = int(m.group(1))
+                break
+
+    missing = [
+        f"{section}.{field}"
+        for section, fields in (
+            ("EL", ("total", "rule", "if")),
+            ("IL", ("total", "rule", "if", "let")),
+            ("SL", ("total", "rule", "if", "let")),
+        )
+        for field in fields
+        if field not in metrics.get(section, {})
+    ]
+    if missing:
+        raise SystemExit(
+            f"Could not find expected field(s) {missing} in p4spectec-stat output:\n{text}"
+        )
+
+    return metrics
+
+
+def print_table(rows: list[tuple[str, str, str, str, str]]):
+    header = ("", "rel/call", "if", "let", "Total")
+    widths = [max(len(header[i]), *(len(row[i]) for row in rows)) for i in range(len(header))]
+
+    def fmt_row(cells):
+        return "  ".join(c.rjust(widths[i]) if i > 0 else c.ljust(widths[i]) for i, c in enumerate(cells))
+
+    print()
+    print("Table 5: Comparison of EL, IL, and SL.")
+    print(fmt_row(header))
+    print("  ".join("-" * w for w in widths))
+    for cells in rows:
+        print(fmt_row(cells))
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run `make stat`/p4spectec-stat and print Table 5 (Comparison of EL, IL, and SL)."
+    )
+    parser.add_argument(
+        "--spectec", required=True, metavar="DIR",
+        help="p4-spectec project root (contains p4spectec-stat binary and spec/)",
+    )
+    parser.add_argument(
+        "-l", "--logs", required=True, metavar="DIR",
+        help="Base logs directory; rq2/make-stat.log and rq2/p4spectec-stat.log will be written inside it",
+    )
+    args = parser.parse_args()
+
+    spectec_dir = str(Path(args.spectec).resolve())
+    logs_dir = Path(args.logs).resolve() / "rq2"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    stat_output = run_stat(spectec_dir, logs_dir)
+    metrics = parse_stat_log(stat_output)
+
+    rows = [
+        ("EL Prems (#)", str(metrics["EL"]["rule"]), str(metrics["EL"]["if"]), "-", str(metrics["EL"]["total"])),
+        ("IL Prems (#)", str(metrics["IL"]["rule"]), str(metrics["IL"]["if"]), str(metrics["IL"]["let"]), str(metrics["IL"]["total"])),
+        ("SL Instrs (#)", str(metrics["SL"]["rule"]), str(metrics["SL"]["if"]), str(metrics["SL"]["let"]), str(metrics["SL"]["total"])),
+    ]
+
+    print_table(rows)
+
+
+if __name__ == "__main__":
+    main()

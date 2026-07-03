@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Print Table 6 (Comparison of Petr4, HOL4P4, and P4-SpecTec) from CSVs
+produced by `scripts/rq3`, or from the pre-run CSVs bundled at
+`logs/rq3-pre` (default). Does not run any tests."""
+
+import argparse
+import csv
+import sys
+from pathlib import Path
+
+# (table row name, CSV filename, kind)
+SUITES = [
+    ("Pos",      "positive-static-results.csv",  "static"),
+    ("Neg",      "negative-static-results.csv",  "static"),
+    ("V1Model",  "v1model-dynamic-results.csv",  "dynamic"),
+    ("V1Model+", "v1model+-dynamic-results.csv", "dynamic"),
+    ("eBPF",     "ebpf-dynamic-results.csv",     "dynamic"),
+    ("eBPF+",    "ebpf+-dynamic-results.csv",    "dynamic"),
+]
+SUITE_CHOICES = [name for name, _, _ in SUITES]
+GROUP_BREAKS = {"Neg", "V1Model+"}  # print a separator after these rows
+
+
+def col_lookup(fieldnames: list[str]) -> dict[str, str]:
+    return {fn.strip().lower(): fn for fn in fieldnames}
+
+
+def pct_cell(n: int, total: int) -> str:
+    return f"{n} ({n / total * 100:.1f}%)"
+
+
+def tally(csv_path: Path, kind: str) -> tuple[str, str, str, str]:
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        cols = col_lookup(reader.fieldnames or [])
+        rows = list(reader)
+
+    result_cols = [cols["petr4"], cols["p4-spectec"]]
+    if kind == "dynamic":
+        result_cols.append(cols["hol4p4"])
+    rows = [r for r in rows if not any(r[c] == "EXCLUDE" for c in result_cols)]
+
+    total = len(rows)
+    petr4 = sum(1 for r in rows if r[cols["petr4"]] == "PASS")
+    spectec = sum(1 for r in rows if r[cols["p4-spectec"]] == "PASS")
+    petr4_cell = pct_cell(petr4, total)
+    spectec_cell = pct_cell(spectec, total)
+
+    if kind == "static":
+        hol4p4_cell = "-"
+    else:
+        hol4p4 = sum(1 for r in rows if r[cols["hol4p4"]] == "PASS")
+        hol4p4_cell = pct_cell(hol4p4, total)
+
+    return str(total), petr4_cell, hol4p4_cell, spectec_cell
+
+
+def print_table(rows: list[tuple[str, str, str, str, str]]):
+    header = ("Target", "Total", "Petr4", "HOL4P4", "P4-SpecTec")
+    cell_rows = [tuple(str(c) for c in row) for row in rows]
+    widths = [max(len(header[i]), *(len(row[i]) for row in cell_rows)) for i in range(len(header))]
+
+    def fmt_row(cells):
+        return "  ".join(c.rjust(widths[i]) if i > 0 else c.ljust(widths[i]) for i, c in enumerate(cells))
+
+    total_width = sum(widths) + 2 * (len(widths) - 1)
+
+    print()
+    print("Table 6: Comparison of Petr4, HOL4P4, and P4-SpecTec.")
+    print(fmt_row(header))
+    print("  ".join("-" * w for w in widths))
+    for row, cells in zip(rows, cell_rows):
+        print(fmt_row(cells))
+        if row[0] in GROUP_BREAKS:
+            print("-" * total_width)
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Print Table 6 (Comparison of Petr4, HOL4P4, and P4-SpecTec) "
+        "from scripts/rq3's CSV output."
+    )
+    parser.add_argument(
+        "-l", "--logs", required=True, metavar="DIR",
+        help="Root logs directory (reads DIR/rq3-pre/*.csv or DIR/rq3/*.csv, see --live)",
+    )
+    parser.add_argument(
+        "--live", action="store_true",
+        help="Read from DIR/rq3 (a real scripts/rq3 run) instead of the bundled "
+        "pre-run CSVs at DIR/rq3-pre (default)",
+    )
+    parser.add_argument(
+        "-s", "--suites", nargs="+", choices=SUITE_CHOICES, default=SUITE_CHOICES,
+        metavar="SUITE",
+        help=f"Test suites to include (default: all). Choices: {', '.join(SUITE_CHOICES)}",
+    )
+    args = parser.parse_args()
+
+    logs_dir = Path(args.logs).resolve() / ("rq3" if args.live else "rq3-pre")
+    if not logs_dir.is_dir():
+        print(f"Warning: {logs_dir} does not exist.", file=sys.stderr)
+
+    filenames = {name: (filename, kind) for name, filename, kind in SUITES}
+    rows = []
+    for name in SUITE_CHOICES:
+        if name not in args.suites:
+            continue
+        filename, kind = filenames[name]
+        csv_path = logs_dir / filename
+        if not csv_path.is_file():
+            rows.append((name, "N/A", "N/A", "N/A", "N/A"))
+        else:
+            rows.append((name, *tally(csv_path, kind)))
+
+    print_table(rows)
+
+
+if __name__ == "__main__":
+    main()

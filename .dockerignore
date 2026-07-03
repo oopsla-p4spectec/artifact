@@ -1,0 +1,5 @@
+.git
+**/_build
+**/*.install
+petr4/_opam
+p4-spectec/_opam

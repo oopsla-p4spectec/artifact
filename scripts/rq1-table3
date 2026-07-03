@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Print Table 3 (P4 type checker backend results) from JSON logs already
+produced by `scripts/rq1`. Does not run any tests."""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+SUITE_CHOICES = ["POS", "NEG"]
+LOG_PREFIX = {"POS": "static-POS-", "NEG": "static-NEG-"}
+
+
+def find_latest_log(logs_dir: Path, prefix: str) -> Path | None:
+    matches = sorted(logs_dir.glob(f"{prefix}*.json"))
+    return matches[-1] if matches else None
+
+
+def tally(log_path: Path | None) -> tuple[str, str, str, str]:
+    if log_path is None:
+        return ("N/A", "N/A", "N/A", "N/A")
+    results = json.loads(log_path.read_text())
+    npass = sum(1 for r in results if r[-1] == "PASS")
+    nfail = sum(1 for r in results if r[-1] == "FAIL")
+    nexcl = sum(1 for r in results if r[-1] == "EXCLUDE")
+    return (str(npass), str(nfail), str(nexcl), str(len(results)))
+
+
+def print_table(rows: list[tuple[str, int, int, int, int]]):
+    header = ("Target", "Pass", "Fail", "Excluded", "Total")
+    cell_rows = [tuple(str(c) for c in row) for row in rows]
+    widths = [max(len(header[i]), *(len(row[i]) for row in cell_rows)) for i in range(len(header))]
+
+    def fmt_row(cells):
+        return "  ".join(c.rjust(widths[i]) if i > 0 else c.ljust(widths[i]) for i, c in enumerate(cells))
+
+    print()
+    print("Table 3: P4 type checker backend results.")
+    print(fmt_row(header))
+    print("  ".join("-" * w for w in widths))
+    for cells in cell_rows:
+        print(fmt_row(cells))
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Print Table 3 (P4 type checker backend results) from scripts/rq1's JSON logs."
+    )
+    parser.add_argument(
+        "-l", "--logs", required=True, metavar="DIR",
+        help="Root logs directory previously passed to scripts/rq1 (reads DIR/rq1/*.json)",
+    )
+    parser.add_argument(
+        "-s", "--suites", nargs="+", choices=SUITE_CHOICES, default=SUITE_CHOICES,
+        metavar="SUITE",
+        help=f"Test suites to include (default: all). Choices: {', '.join(SUITE_CHOICES)}",
+    )
+    args = parser.parse_args()
+
+    logs_dir = Path(args.logs).resolve() / "rq1"
+    if not logs_dir.is_dir():
+        print(f"Warning: {logs_dir} does not exist. Run scripts/rq1 first.", file=sys.stderr)
+
+    rows = []
+    for name in SUITE_CHOICES:
+        if name not in args.suites:
+            continue
+        log_path = find_latest_log(logs_dir, LOG_PREFIX[name])
+        rows.append((name, *tally(log_path)))
+
+    print_table(rows)
+
+
+if __name__ == "__main__":
+    main()

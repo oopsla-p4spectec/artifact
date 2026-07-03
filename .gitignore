@@ -1,0 +1,5 @@
+scripts/__pycache__
+logs/*
+!logs/rq3-pre
+*.swp
+**/*.filtered/
