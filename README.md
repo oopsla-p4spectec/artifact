@@ -6,7 +6,7 @@ In this README, we explain how to:
 
 1. [Install P4-SpecTec and the Artifact](#1-installation)
 2. [Organization](#2-organization)
-3. [Use the P4-SpecTec Framework](#3-using-the-p4-spectec-framework)
+3. [Kick-the-Tires: Basic P4-SpecTec Functionality](#3-kick-the-tires-basic-p4-spectec-functionality)
 4. [Reproduce RQ1, RQ2, and RQ3](#4-reproducing-rq1-rq2-and-rq3)
     * [RQ1: Adequacy of Algorithmic Inference Rules](#rq1-adequacy-of-algorithmic-inference-rules)
     * [RQ2: Effectiveness of Structuring](#rq2-effectiveness-of-structuring)
@@ -38,7 +38,7 @@ This artifact repository is organized as follows:
 └── logs/          # Output logs and results from running the scripts
 ```
 
-## 3. Using the P4-SpecTec Framework
+## 3. Kick-the-Tires: Basic P4-SpecTec Functionality
 
 We demonstrate how to parse the mechanized spec to EL, elaborate it to IL,
 structure it to SL, and generate PL for prose generation.
@@ -139,11 +139,19 @@ stdout.
 We provide scripts that wrap the commands above to reproduce the results in
 RQ1, RQ2, and RQ3. The scripts are located in the `scripts/` directory.
 
+### List of Claims
+
+- **Table 2** (categorization of excluded tests, RQ1.A) — `scripts/rq1-table2`
+- **Tables 3 and 4** (P4 type checker and interpreter backend results, RQ1.A) — `scripts/rq1`, then `scripts/rq1-table3` and `scripts/rq1-table4`
+- **Document backend** (RQ1.B) — pre-generated at `p4-spectec/docs/P4-16-spec-release.html` and `p4-spectec/docs/P4-16-spec-release.pdf`
+- **Table 5** and **Fig. 16** (comparison of EL, IL, and SL; performance of IL vs. SL, RQ2) — `scripts/rq2-table5`, then `scripts/rq2` and `scripts/rq2-fig16`
+- **Table 6** (comparison of P4-SpecTec, Petr4, and HOL4P4, RQ3) — `scripts/rq3`, then `scripts/rq3-table6`
+
 ### RQ1: Adequacy of Algorithmic Inference Rules
 
 #### A. Executable backend tests
 
-##### Experimental Setup (Reproducing Table 2)
+#### Experimental Setup (Reproducing Table 2)
 
 We run tests on positive and negative type checker tests for the type checker backend:
 
@@ -173,7 +181,7 @@ from the paper, reading directly from `testdata/excludes`:
 $ scripts/rq1-table2 -e testdata/excludes
 ```
 
-##### Running the Tests (Reproducing Tables 3 and 4)
+#### Running the Tests (Reproducing Tables 3 and 4)
 
 Execute the following command to run the P4-SpecTec P4 type checker and
 interpreter backend tests, on the SL interpreter with `-det` mode.
@@ -273,7 +281,7 @@ format `scripts/rq3` itself produces. You may jump to the [Reproducing Table
 6](#reproducing-table-6) section to skip running the tests and use the pre-run
 CSVs.
 
-##### Static Semantics
+#### Static Semantics
 
 We compare the implementation of P4 static semantics from P4-SpecTec and Petr4
 by running both positive and negative type checker tests on the two projects.
@@ -312,7 +320,7 @@ $ scripts/rq3 -i p4include -e testdata/excludes/ -t testdata -l logs \
    static petr4 neg
 ```
 
-##### Dynamic Semantics
+#### Dynamic Semantics
 
 We compare the implementation of P4 dynamic semantics from P4-SpecTec, Petr4
 and HOL4P4 by running the test suites `V1Model`, `eBPF`, `V1Model+`, and

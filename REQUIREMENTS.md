@@ -40,7 +40,7 @@ dependencies, per project.
 
 ## Time Requirements
 
-- Reproducing the Running Example: ~5 minutes
+- Kick-the-Tires: ~5 minutes
 - Reproducing RQ1 (`scripts/rq1`, all test suites): ~20 minutes on a 2020
   MacBook Air (Apple M1, 16GB RAM); the `V1Model` and `V1Model+` suites
   account for most of the runtime
