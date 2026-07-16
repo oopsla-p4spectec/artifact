@@ -22,7 +22,23 @@ installing from source on Ubuntu 22.04.
 
 ## 2. Organization
 
-This artifact repository is organized as follows:
+If installed via Docker, the root should contain the following directories:
+
+```
+/
+├── p4-spectec/    # P4-SpecTec submodule (framework, mechanized spec, binary)
+│   ├── p4spec/    # OCaml implementation of the P4-SpecTec framework
+│   ├── spec/      # Mechanized P4 specification
+│   └── docs/      # Generated HTML/PDF specifications (RQ1.B)
+├── petr4/         # Petr4 project, used for comparison in RQ3
+├── HOL4P4/        # HOL4P4 project, used for comparison in RQ3
+├── p4include/     # P4 library headers used by test programs
+├── testdata/      # Test suites (p4c, p4testgen), excludes, and patches
+├── scripts/       # rq1, rq2, rq3 reproduction scripts
+└── logs/          # Output logs and results from running the scripts
+```
+
+If instead installed from source, the project root will contain the following directories:
 
 ```
 /

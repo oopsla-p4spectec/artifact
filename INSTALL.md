@@ -196,7 +196,16 @@ $ ./p4spectec-test --help
 ```
 
 If you installed HOL4P4 and/or Petr4 (required for RQ3), confirm their builds
-succeeded without errors as reported by `scripts/install.sh` (HOL4P4) and
-`dune build`/`dune install` (Petr4) above.
+succeeded with the following commands (paths shown are for the Docker image; if
+installed from source, use `petr4/` and `hol4p4/` under the cloned repository
+root instead):
+
+```bash
+# Petr4: binary should print its CLI help
+$ /petr4/_opam/bin/petr4 --help
+
+# HOL4P4: Holmake and poly should be on PATH, and the "hol4p4" opam switch should exist
+$ command -v Holmake && command -v poly && opam switch list --short | grep -qx hol4p4 && echo OK
+```
 
 See [README.md](README.md) for instructions on reproducing RQ1, RQ2, and RQ3.
