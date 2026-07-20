@@ -20,6 +20,10 @@ instructions. We offer three installation options: pulling a pre-built image
 from DockerHub (recommended), building the Docker image from source, or
 installing from source on Ubuntu 22.04.
 
+For Docker, we have tested the artifact on MacOS/Apple Silicon, Windows/x64,
+and Ubuntu 22.04/x64. For source installation, we have tested the artifact on
+Ubuntu 22.04/x64.
+
 ## 2. Organization
 
 If installed via Docker, the root should contain the following directories:
